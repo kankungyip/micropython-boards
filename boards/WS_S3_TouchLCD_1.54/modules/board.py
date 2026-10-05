@@ -52,12 +52,11 @@ def init(sd_point=SD_POINT):
     # ============================================================
     # 初始化 SD 卡
     # ============================================================
-    global _sd_point
-    _sd_point = sd_point
-    sd_init()
+    sd_init(sd_point)
 
 
-def sd_init():
+def sd_init(sd_point=SD_POINT):
+    global _sd_ready, _sd_point
     if _sd_ready:
         return
 
@@ -74,6 +73,8 @@ def sd_init():
             cmd=Pin(15),
             data=(Pin(17), Pin(18), Pin(13), Pin(14)),
         )
+        if _sd_point != sd_point:
+            _sd_point = sd_point
         os.mount(sd, _sd_point)
         _sd_ready = True
     except Exception as e:

@@ -197,7 +197,7 @@ def build(board_info):
     resources_dir = os.path.join(board_dir, "resources")
     # out firmware path
     out_firmware = os.path.join(
-        dist_dir, f"{board}.{board_info['version']}.bin".lower()
+        dist_dir, f"{board}_{board_info['version']}.bin".lower()
     )
 
     if not is_exists(dist_dir):

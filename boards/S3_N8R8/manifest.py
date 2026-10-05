@@ -2,8 +2,9 @@ include("$(PORT_DIR)/boards")
 
 include("$(MOD_DIR)/fos")
 include("$(MOD_DIR)/blerepl")
-include("$(MOD_DIR)/macutils")
-include("$(MOD_DIR)/settings")
+
+include("$(MOD_DIR)/utils/manifest.macutils.py")
+include("$(MOD_DIR)/utils/manifest.settings.py")
 
 require("base64")
 require("hmac")
