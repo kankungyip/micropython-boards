@@ -1,17 +1,22 @@
 import os
 
 from cst3xx import Cst3xx
-from machine import SPI, Pin, SDCard
+from machine import I2C, RTC, SPI, Pin, SDCard
+from pcf85063 import PCF85063A
+from qmi8658 import QMI8658
 from st77xx import St7789
 
 SD_POINT = "/sd"
 
-display = None
-touch = None
-sd = None
-
 _sd_point = SD_POINT
 _sd_ready = False
+
+sd = None
+i2c = None
+rtc = None
+imu = None
+display = None
+touch = None
 
 
 def __getattr__(name):
@@ -36,6 +41,30 @@ def __getattr__(name):
 
 
 def init(sd_point=SD_POINT):
+    # ============================================================
+    # 初始化 RTC
+    # ============================================================
+    global i2c, rtc
+    i2c = I2C(0, scl=Pin(11), sda=Pin(10))
+    try:
+        rtc = PCF85063(i2c, int_pin=5)
+        sys_rtc = RTC()
+        y, mo, d, wd, h, mi, s = rtc.datetime()
+        if rtc.oscillator_stopped:
+            print("PCF85063 oscillator stopped")
+        sys_rtc.datetime((y, mo, d, wd, h, mi, s, 0))
+    except Exception as e:
+        print("RTC initialization failed", e)
+
+    # ============================================================
+    # 初始化IMU
+    # ============================================================
+    global imu
+    try:
+        imu = QMI8658(i2c, int1_pin=13, int2_pin=12)
+    except Exception as e:
+        print("IMU initialization failed", e)
+
     # ============================================================
     # 初始化显示与触摸
     # ============================================================
