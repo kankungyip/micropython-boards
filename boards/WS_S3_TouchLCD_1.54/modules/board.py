@@ -17,6 +17,9 @@ imu = None
 display = None
 touch = None
 
+button_key = button_plus = None
+button_boot = button_minus = None
+
 
 def __getattr__(name):
     global _sd_ready
@@ -39,6 +42,13 @@ def __getattr__(name):
 
 
 def init(sd_point=SD_POINT):
+    # ============================================================
+    # 初始化按钮
+    # ============================================================
+    global button_key, button_boot, button_plus, button_minus
+    button_key = button_plus = Pin(4, Pin.IN, Pin.PULL_UP)
+    button_boot = button_minus = Pin(0, Pin.IN, Pin.PULL_UP)
+
     # ============================================================
     # 初始化显示与触摸
     # ============================================================
