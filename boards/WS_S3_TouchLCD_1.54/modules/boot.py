@@ -3,6 +3,7 @@ import time
 import machine
 from machine import Pin
 
+# 电源控制
 BAT_EN_PIN = 2
 KEY_PWR_PIN = 5
 

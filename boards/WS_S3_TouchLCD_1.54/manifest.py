@@ -10,6 +10,8 @@ include("$(MPY_DIR)/../lv_binding/ports/esp32")
 include("$(MOD_DIR)/lv_drivers/display/st77xx.manifest.py")
 include("$(MOD_DIR)/lv_drivers/touch/cst8xx.manifest.py")
 
+include("$(MOD_DIR)/drivers/posture/qmi8658.manifest.py")
+
 require("base64")
 require("hmac")
 require("logging")
