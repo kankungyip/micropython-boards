@@ -15,12 +15,12 @@ Fork: [https://github.com/lemariva/micropython-camera-driver](https://github.com
 - **关键词参数**
   - `format`, 图片数据格式
 
-    | 格式               | 说明                |
-    | ------------------ | ------------------- |
-    | `camera.JPEG`      | JPEG 格式（默认值） |
-    | `camera.YUV422`    | YUV422              |
-    | `camera.RGB565`    | RGB565              |
-    | `camera.GRAYSCALE` | 灰度                |
+    | 格式               | 说明              |
+    | ------------------ | ----------------- |
+    | `camera.JPEG`      | JPEG 格式         |
+    | `camera.YUV422`    | YUV422            |
+    | `camera.RGB565`    | RGB565 （默认值） |
+    | `camera.GRAYSCALE` | 灰度              |
 
   - `framesize`, 分辨率（帧尺寸）
 
@@ -50,25 +50,25 @@ Fork: [https://github.com/lemariva/micropython-camera-driver](https://github.com
     | `camera.FRAME_QSXGA`   | 2560×2048         |
 
   - `quality`，JPEG 质量，默认值：12，可选范围：0~63
-  - `d0`，D0 引脚，默认值：11（M5Stack AtomS3R CAM 引脚值）
-  - `d1`，D1 引脚，默认值：9（M5Stack AtomS3R CAM 引脚值）
-  - `d2`，D2 引脚，默认值：8（M5Stack AtomS3R CAM 引脚值）
-  - `d3`，D3 引脚，默认值：10（M5Stack AtomS3R CAM 引脚值）
-  - `d4`，D4 引脚，默认值：12（M5Stack AtomS3R CAM 引脚值）
-  - `d5`，D5 引脚，默认值：18（M5Stack AtomS3R CAM 引脚值）
-  - `d6`，D6 引脚，默认值：17（M5Stack AtomS3R CAM 引脚值）
-  - `d7`，D7 引脚，默认值：16（M5Stack AtomS3R CAM 引脚值）
-  - `vsync`，VSYNC 引脚，默认值：6（M5Stack AtomS3R CAM 引脚值）
-  - `href`，HREF 引脚，默认值：7（M5Stack AtomS3R CAM 引脚值）
-  - `pclk`，PCLK 引脚，默认值：13（M5Stack AtomS3R CAM 引脚值）
-  - `pwdn`，POWER 引脚，默认值：-1（不使用）
-  - `reset`，RESET 引脚，默认值：-1（不使用）
-  - `xclk`，XCLK 引脚，默认值：15（M5Stack AtomS3R CAM 引脚值）
-  - `sda`，SDA 引脚，默认值：4（M5Stack AtomS3R CAM 引脚值）
-  - `scl`，SCL 引脚，默认值：5（M5Stack AtomS3R CAM 引脚值）
-  - `xclk_freq`，XCLK 信号频率，默认值：`camera.XCLK_10MHz`，可选值：`camera.XCLK_20MHz`
+  - `d0`，D0 引脚
+  - `d1`，D1 引脚
+  - `d2`，D2 引脚
+  - `d3`，D3 引脚
+  - `d4`，D4 引脚
+  - `d5`，D5 引脚
+  - `d6`，D6 引脚
+  - `d7`，D7 引脚
+  - `vsync`，VSYNC 引脚
+  - `href`，HREF 引脚
+  - `pclk`，PCLK 引脚
+  - `pwdn`，POWER 引脚
+  - `reset`，RESET 引脚
+  - `xclk`，XCLK 引脚
+  - `sda`，SDA 引脚
+  - `scl`，SCL 引脚
+  - `xclk_freq`，XCLK 信号频率，默认值：`camera.XCLK_20MHz`，可选值：`camera.XCLK_10MHz`
   - `fb_size`，帧缓存数量，默认值：1
-  - `fb_location`，帧缓存区，默认值：`camera.FB_DRAM`，可选值：`camera.FB_PSRAM`
+  - `fb_location`，帧缓存区，默认值：`camera.FB_PSRAM`，可选值：`camera.FB_DRAM`
 
 #### `camera.deinit()`
 
