@@ -53,7 +53,7 @@ def esp32_flash(board_info, firmware_path):
 
     if not firmware_path:
         firmware_path = os.path.join(
-            dist_dir, f"{args.board}.{board_info['version']}.bin"
+            dist_dir, f"{args.board}_{board_info['version']}.bin"
         )
 
     if not is_exists(firmware_path):
