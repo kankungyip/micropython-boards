@@ -16,7 +16,7 @@ CHT8320 温湿度传感器 MicroPython 驱动
     temperature_c = -45.0 + 175.0 * t_raw / 65535.0
     humidity_rh  = 100.0 * h_raw / 65535.0
 
-缓存策略（cache_timeout）:
+缓存策略（cache_timeout_ms）:
     0    -> 禁用缓存，每次访问属性都重新测量
     None -> 永久缓存，仅首次访问或 invalidate() 后测量
     >0   -> 缓存有效期 ms
@@ -33,10 +33,10 @@ CHT8320 温湿度传感器 MicroPython 驱动
         time.sleep_ms(1000)
 
 用法（不缓存）:
-    sensor = CHT8320(i2c, cache_timeout=0)
+    sensor = CHT8320(i2c, cache_timeout_ms=0)
 
 用法（永久缓存）:
-    sensor = CHT8320(i2c, cache_timeout=None)
+    sensor = CHT8320(i2c, cache_timeout_ms=None)
 
 用法（手动控制测量时机）:
     sensor.measure("high")       # 触发测量，不阻塞
@@ -82,12 +82,11 @@ class CHT8320:
         "_i2c",
         "_addr",
         "_repeatability",
-        "_cache_timeout",
+        "_cache_timeout_ms",
         "_temperature",
         "_humidity",
         "_last_read_ms",
         "_last_error",
-        "_error_handler",
         "_retries",
         "_retry_delay_ms",
         "_deinit",
@@ -99,8 +98,7 @@ class CHT8320:
         i2c,
         addr=_CHT8320_DEFAULT_ADDR,
         repeatability="high",
-        cache_timeout=1000,
-        error_handler=None,
+        cache_timeout_ms=1000,
         retries=2,
         retry_delay_ms=5,
     ):
@@ -109,9 +107,8 @@ class CHT8320:
             i2c (I2C): 已初始化的 I2C 对象（外部注入）。
             addr (int): I2C 地址，默认 0x44。
             repeatability (str): 'high' / 'medium' / 'low'。
-            cache_timeout (int | None): 缓存有效期 ms；
+            cache_timeout_ms (int | None): 缓存有效期 ms；
                 0=禁用，None=永久，>0=有效期。
-            error_handler (callable | None): 错误回调 fn(exc)。
             retries (int): I2C 重试次数，默认 2。
             retry_delay_ms (int): 重试间隔 ms，默认 5。
 
@@ -120,23 +117,22 @@ class CHT8320:
         """
         if repeatability not in _REPEATABILITY:
             raise ValueError("repeatability must be 'high', 'medium' or 'low'")
-        if cache_timeout is not None and (
-            not isinstance(cache_timeout, int) or cache_timeout < 0
+        if cache_timeout_ms is not None and (
+            not isinstance(cache_timeout_ms, int) or cache_timeout_ms < 0
         ):
-            raise ValueError("cache_timeout must be None or int >= 0")
+            raise ValueError("cache_timeout_ms must be None or int >= 0")
 
         self._i2c = i2c
         self._addr = addr
         self._repeatability = repeatability
-        self._cache_timeout = cache_timeout
+        self._cache_timeout_ms = cache_timeout_ms
         self._temperature = None
         self._humidity = None
         self._last_read_ms = None
         self._last_error = None
-        self._error_handler = error_handler
         self._retries = retries
         self._retry_delay_ms = retry_delay_ms
-        self._deinit = False
+
         self._buf = bytearray(_READ_SIZE)
 
         # 上电后软复位到确定状态
@@ -164,18 +160,8 @@ class CHT8320:
 
     # ---------------- 内部 ----------------
     def _check_deinit(self):
-        if self._deinit:
+        if self._i2c is None:
             raise RuntimeError("device is deinitialized")
-
-    def _call_error_handler(self, exc):
-        """保存并分发错误。"""
-        self._last_error = exc
-        handler = self._error_handler
-        if handler is not None:
-            try:
-                handler(exc)
-            except Exception as nested:
-                self._last_error = nested
 
     def _ensure_data(self):
         if self._is_cache_valid():
@@ -185,14 +171,15 @@ class CHT8320:
     def _is_cache_valid(self):
         if self._temperature is None or self._humidity is None:
             return False
-        if self._cache_timeout is None:
+        if self._cache_timeout_ms is None:
             return True
-        if self._cache_timeout == 0:
+        if self._cache_timeout_ms == 0:
             return False
         if self._last_read_ms is None:
             return False
         return (
-            time.ticks_diff(time.ticks_ms(), self._last_read_ms) < self._cache_timeout
+            time.ticks_diff(time.ticks_ms(), self._last_read_ms)
+            < self._cache_timeout_ms
         )
 
     # ---------------- 底层 ----------------
@@ -341,7 +328,6 @@ class CHT8320:
 
     def deinit(self):
         """释放资源：置 deinit 标志。幂等。"""
-        if self._deinit:
+        if self._i2c is None:
             return
         self._i2c = None
-        self._deinit = True

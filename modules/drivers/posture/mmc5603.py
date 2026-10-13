@@ -1,61 +1,48 @@
 """
-MMC5603 三轴磁力计 MicroPython 驱动
+MMC5603 三轴磁力计驱动（MicroPython）。
+
+用途:
+    通过 I2C 读取 MMC5603 三轴磁力计数据，提供原始计数、毫高斯值、
+    磁场模长、磁航向角与硬磁校准接口。
 
 依赖:
-    math, time, micropython.const
+    machine（I2C 由调用方注入）、time、math、micropython.const。
+
 目标固件:
-    MicroPython v1.19+（ESP32 / RP2040 / STM32 / ESP8266）
+    MicroPython v1.19+，使用 readfrom_mem_into / ticks_diff。
 
-坐标系与换算（右手系，芯片安装方向以数据手册为准）:
-    raw20  = (MSB << 12) | (MID << 4) | (LSB >> 4)     # 20 位无符号
-    gauss  = _SENSITIVITY * (raw20 - offset)
-             _SENSITIVITY = 0.0625（厂商示例系数，物理单位详见数据手册）
-    offset 默认 1 << 19 = 524288，为 20 位输出中点（硬铁零点）。
+单位与坐标系:
+    - 输出单位：毫高斯（mG）。value_mg = 0.0625 * (raw - offset)。
+    - 原始值范围 0 .. 2**20-1，零点 2**19 = 524288。
+    - get_heading() 使用 X/Y 平面，仅适用于传感器水平放置：
+          板子 +Y 指向磁北 -> 0°
+          板子 +X 指向磁北 -> 90°
+          板子 -Y 指向磁北 -> 180°
+          板子 -X 指向磁北 -> 270°
+      计算式 heading = (degrees(atan2(-x_mg, y_mg)) + declination) % 360。
 
-Yaw / Heading:
-    水平安装（upright=False）: yaw 基于 XY 平面，atan2(y, -x)
-    竖直安装（upright=True）:  yaw 基于 XZ 平面，atan2(z, -x)
-    declination 为磁偏角（度，东正西负）。
-    get_yaw 返回 -180..180；get_heading 返回 0..360。
+中断:
+    本驱动不使用硬件中断。ISR 内不要调用 read() / read_raw()。
+    如需后台采样，请在主循环或定时器中周期性调用 read()。
 
-用法（最小示例）:
+版本:
+    v1.0.0
+
+变更日志:
+    [FIX]      deinit() 后调用 I/O 方法抛 RuntimeError，不再触发 AttributeError。
+    [ADD]      read_strength() 磁场模长（此前仅在模块 docstring 中出现）。
+    [CHANGE]   read_raw() 内部解析逻辑抽到 _parse_raw() 静态方法。
+
+典型用法:
     from machine import I2C, Pin
-    import time
     from mmc5603 import MMC5603
-
-    i2c = I2C(0, scl=Pin(22), sda=Pin(21), freq=400000)
-    mag = MMC5603(i2c)
-    while True:
-        gx, gy, gz = mag.read()
-        print("mag=%.3f,%.3f,%.3f  strength=%.3f  heading=%.1f"
-              % (gx, gy, gz, mag.get_strength(), mag.get_heading()))
-        time.sleep_ms(200)
-
-用法（校准 + 持久化）:
-    offsets = mag.calibrate(duration_ms=20000,
-                            progress_callback=lambda p: print(p, "%"))
-    print("offsets:", offsets)
-    # 调用方自行持久化:
-    with open("magnetic_cal.py", "w") as f:
-        f.write("_offset_x=%r\n_offset_y=%r\n_offset_z=%r\n" % offsets)
-
-用法（下次启动加载）:
-    try:
-        import magnetic_cal
-        cal = (magnetic_cal._offset_x,
-               magnetic_cal._offset_y,
-               magnetic_cal._offset_z)
-    except ImportError:
-        cal = None
-    mag = MMC5603(i2c, calibration=cal)
-
-用法（错误处理）:
-    def on_error(exc):
-        print("MMC5603 error:", exc)
-    mag = MMC5603(i2c, error_handler=on_error)
-
-用法（低层，高频）:
-    rx, ry, rz = mag.read_raw()     # 原始 20 位整数，无 float
+    mag = MMC5603(I2C(0, scl=Pin(1), sda=Pin(0), freq=400_000))
+    mag.read()                            # (x, y, z) mG
+    mag.read_raw()                        # (x, y, z) 原始计数
+    mag.read_strength()                   # 磁场模长 mG
+    mag.get_heading()                     # 磁航向 [0, 360)
+    mag.get_heading(declination=-3.5)     # 真北方向
+    mag.calibrate(); mag.save_calibration("mag_cal.txt")
 """
 
 import math
@@ -65,450 +52,510 @@ from micropython import const
 
 __all__ = ("MMC5603",)
 
-# ==================== I2C 地址 ====================
-MMC5603_DEFAULT_ADDR = const(0x30)
 
-# ==================== 寄存器地址 ====================
-MMC5603_REG_DATA = const(0x00)
-MMC5603_REG_TMP = const(0x09)
-MMC5603_REG_ODR = const(0x1A)
-MMC5603_REG_CTRL0 = const(0x1B)
-MMC5603_REG_CTRL1 = const(0x1C)
-MMC5603_REG_CTRL2 = const(0x1D)
-MMC5603_REG_X_THD = const(0x1E)
-MMC5603_REG_Y_THD = const(0x1F)
-MMC5603_REG_Z_THD = const(0x20)
-MMC5603_REG_ST_X_VAL = const(0x27)
-MMC5603_REG_DEVICE_ID = const(0x39)
+# ---------------------------------------------------------------------------
+# 常量
+# ---------------------------------------------------------------------------
 
-# ==================== 芯片 ID ====================
-MMC5603_CHIP_ID = const(0x10)
+_I2C_ADDR_DEFAULT = const(0x30)
+_DEVICE_ID = const(0x10)
 
-# ==================== CTRL0 位 ====================
-CTRL0_SET = const(0x08)  # SET 线圈操作
-CTRL0_TAKE_MEAS = const(0x01)  # 单次测量
-CTRL0_AUTO_SR = const(0x20)  # 自动置位/复位
-CTRL0_CMM_FREQ = const(0x80)  # 连续测量模式
+_REG_DATA = const(0x00)
+_REG_TMP = const(0x09)
+_REG_ODR = const(0x1A)
+_REG_CTRL0 = const(0x1B)
+_REG_CTRL1 = const(0x1C)
+_REG_CTRL2 = const(0x1D)
+_REG_X_THD = const(0x1E)
+_REG_Y_THD = const(0x1F)
+_REG_Z_THD = const(0x20)
+_REG_ST_X_VAL = const(0x27)
+_REG_DEVICE_ID = const(0x39)
 
-# ==================== CTRL2 位 ====================
-CTRL2_HPOWER = const(0x80)  # 高功率
-CTRL2_AUTO_ST = const(0x10)  # 自动自检
+_DATA_BYTES = const(9)
+_ST_TRIM_BYTES = const(3)
 
-# ==================== 换算 / 内部常量 ====================
-# 20 位输出，零点偏移 = 2^19
-_OFFSET_DEFAULT = const(1 << 19)  # 524288
+_CTRL0_SET = const(0x08)
+_CTRL0_CONTINUOUS = const(0xA0)
+_CTRL2_CMM_FREQ_EN = const(0x10)
 
-# 灵敏度系数（厂商示例公式系数）；MicroPython const() 不支持 float
-_SENSITIVITY = 0.0625
+_BANDWIDTH_DEFAULT = const(0x00)
+_ODR_HZ_DEFAULT = const(50)
 
-# 自检阈值计算
-_ST_TRIM_BIAS = const(128)
+_LSB_MG = 0.0625
+_OFFSET_CENTER = const(524288)
+
+_ST_TRIM_CENTER = const(128)
 _ST_TRIM_SCALE = const(32)
-_ST_DIV_5 = const(5)
-_ST_DIV_8 = const(8)
-_ST_MAX = const(0xFF)
+_ST_THD_MAX = const(255)
 
-# 缓冲区 / 长度
-_DATA_LEN = const(9)
-_ST_TRIM_LEN = const(3)
-
-# SET 线圈操作后等待（ms）
+_STARTUP_DELAY_MS = const(50)
 _SET_DELAY_MS = const(5)
 
-# 进入连续模式后等待（ms）
-_START_DELAY_MS = const(50)
-
-# 自检阈值寄存器按 X/Y/Z 顺序
-_ST_THD_REGS = (MMC5603_REG_X_THD, MMC5603_REG_Y_THD, MMC5603_REG_Z_THD)
+_HEADING_FULL_TURN_DEG = 360.0
 
 
 class MMC5603:
     """
-    MMC5603 三轴磁力计驱动类。
+    MMC5603 三轴磁力计驱动。
 
-    属性:
-        raw_x, raw_y, raw_z (int): 最近一次读到的 20 位原始值。
-        last_error (Exception | None): 最近一次后台错误。
+    不变量:
+        - 构造后处于连续测量模式（带宽 0x00，ODR 50 Hz）。
+        - read() 值已扣硬磁偏移，直接使用芯片输出符号。
+        - deinit() 后所有 I/O 方法抛 RuntimeError("device is deinitialized")。
+
+    本驱动不使用硬件中断；ISR 内不要调用 read() / read_raw()。
     """
 
     __slots__ = (
         "_i2c",
         "_addr",
+        "_retries",
+        "_retry_delay_ms",
+        "_tx_buf",
+        "_rx_buf",
+        "_data_buf",
+        "_st_buf",
         "_offset_x",
         "_offset_y",
         "_offset_z",
         "_raw_x",
         "_raw_y",
         "_raw_z",
-        "_last_error",
-        "_error_handler",
-        "_retries",
-        "_retry_delay_ms",
-        "_deinit",
-        "_buf",
     )
 
     def __init__(
         self,
-        i2c_bus,
-        addr=MMC5603_DEFAULT_ADDR,
-        calibration=None,
-        error_handler=None,
+        i2c,
+        addr=_I2C_ADDR_DEFAULT,
         retries=2,
         retry_delay_ms=5,
     ):
         """
         Args:
-            i2c_bus (I2C): 已初始化的 I2C 实例（外部注入，不可为 None）。
-            addr (int): I2C 地址，默认 0x30。
-            calibration (tuple | None): 硬铁偏移 (ox, oy, oz)；
-                None 使用默认零点 1 << 19。
-            error_handler (callable | None): 错误回调 fn(exc)。
-            retries (int): I2C 重试次数，默认 2（总共尝试 retries+1 次）。
+            i2c: 已初始化的 machine.I2C 实例。
+            addr (int): 7 位 I2C 地址，默认 0x30。
+            retries (int): I2C 失败重试次数，默认 2。
             retry_delay_ms (int): 重试间隔 ms，默认 5。
 
         Raises:
-            ValueError: i2c 为 None 或 calibration 长度不为 3。
-            OSError: 芯片 ID 不匹配或 I2C 通信失败。
+            ValueError: 参数非法。
+            OSError: 找不到 MMC5603 或 ID 不匹配。
+
+        Side effects:
+            写 CTRL0/CTRL1/CTRL2/ODR/ST 寄存器，阻塞约 55 ms，不读写文件。
         """
-        if i2c_bus is None:
-            raise ValueError("i2c_bus must not be None")
+        if not 0 <= addr <= 0x7F:
+            raise ValueError("addr must be a 7-bit I2C address (0..0x7F)")
+        if retries < 0:
+            raise ValueError("retries must be >= 0")
+        if retry_delay_ms < 0:
+            raise ValueError("retry_delay_ms must be >= 0")
 
-        self._i2c = i2c_bus
+        self._i2c = i2c
         self._addr = addr
+        self._retries = retries
+        self._retry_delay_ms = retry_delay_ms
 
-        if calibration is None:
-            self._offset_x = _OFFSET_DEFAULT
-            self._offset_y = _OFFSET_DEFAULT
-            self._offset_z = _OFFSET_DEFAULT
-        else:
-            if len(calibration) != 3:
-                raise ValueError("calibration must be (offset_x, offset_y, offset_z)")
-            self._offset_x = calibration[0]
-            self._offset_y = calibration[1]
-            self._offset_z = calibration[2]
+        self._tx_buf = bytearray(1)
+        self._rx_buf = bytearray(1)
+        self._data_buf = bytearray(_DATA_BYTES)
+        self._st_buf = bytearray(_ST_TRIM_BYTES)
+
+        self._offset_x = float(_OFFSET_CENTER)
+        self._offset_y = float(_OFFSET_CENTER)
+        self._offset_z = float(_OFFSET_CENTER)
 
         self._raw_x = 0
         self._raw_y = 0
         self._raw_z = 0
 
-        self._last_error = None
-        self._error_handler = error_handler
-        self._retries = retries
-        self._retry_delay_ms = retry_delay_ms
-        self._deinit = False
-        self._buf = bytearray(_DATA_LEN)
-
-        if self._chip_id() != MMC5603_CHIP_ID:
-            raise OSError("MMC5603 not found at I2C address 0x%02X" % addr)
+        if self._chip_id() != _DEVICE_ID:
+            raise OSError("MMC5603 not found at I2C address 0x%02X" % self._addr)
 
         self._auto_selftest()
-        self._set_coil()
-        self._configure_continuous()
-        time.sleep_ms(_START_DELAY_MS)
+        self._set()
+        self._start_continuous()
+        time.sleep_ms(_STARTUP_DELAY_MS)
 
-    # ==================== 只读属性 ====================
-    @property
-    def raw_x(self):
-        """最近一次读到的 X 轴 20 位原始值。"""
-        return self._raw_x
+    # ------------------------------------------------------------------
+    # 公开 API
+    # ------------------------------------------------------------------
 
-    @property
-    def raw_y(self):
-        """最近一次读到的 Y 轴 20 位原始值。"""
-        return self._raw_y
-
-    @property
-    def raw_z(self):
-        """最近一次读到的 Z 轴 20 位原始值。"""
-        return self._raw_z
-
-    @property
-    def last_error(self):
-        """最近一次后台错误。"""
-        return self._last_error
-
-    # ==================== 内部工具 ====================
-    def _check_deinit(self):
-        if self._deinit:
-            raise RuntimeError("device is deinitialized")
-
-    def _call_error_handler(self, exc):
-        """保存并分发错误。"""
-        self._last_error = exc
-        handler = self._error_handler
-        if handler is not None:
-            try:
-                handler(exc)
-            except Exception as nested:
-                self._last_error = nested
-
-    # ==================== 底层 I2C ====================
-    def _write_reg(self, reg, val):
-        """单字节写寄存器；带重试。失败抛 OSError。"""
-        self._check_deinit()
-        data = bytes((val,))
-        last_err = None
-        for attempt in range(self._retries + 1):
-            try:
-                self._i2c.writeto_mem(self._addr, reg, data)
-                return
-            except OSError as exc:
-                last_err = exc
-                if attempt < self._retries:
-                    time.sleep_ms(self._retry_delay_ms)
-        raise last_err
-
-    def _read_reg(self, reg, nbytes=1):
-        """
-        读寄存器。
-        Args:
-            reg (int): 寄存器地址。
-            nbytes (int): 字节数。
-        Returns:
-            int (nbytes==1) 或 bytes (nbytes>1)。
-        Raises:
-            OSError: I2C 失败。
-        """
-        self._check_deinit()
-        buf = bytearray(nbytes)
-        last_err = None
-        for attempt in range(self._retries + 1):
-            try:
-                self._i2c.readfrom_mem_into(self._addr, reg, buf)
-                return buf[0] if nbytes == 1 else bytes(buf)
-            except OSError as exc:
-                last_err = exc
-                if attempt < self._retries:
-                    time.sleep_ms(self._retry_delay_ms)
-        raise last_err
-
-    def _read_reg_into(self, reg, buf):
-        """读寄存器到预分配缓冲区；带重试。"""
-        self._check_deinit()
-        last_err = None
-        for attempt in range(self._retries + 1):
-            try:
-                self._i2c.readfrom_mem_into(self._addr, reg, buf)
-                return
-            except OSError as exc:
-                last_err = exc
-                if attempt < self._retries:
-                    time.sleep_ms(self._retry_delay_ms)
-        raise last_err
-
-    def _chip_id(self):
-        return self._read_reg(MMC5603_REG_DEVICE_ID)
-
-    # ==================== 初始化辅助 ====================
-    def _auto_selftest(self):
-        """
-        自动配置 SET/RESET 自检阈值（写 X/Y/Z_THD）。
-
-        Notes:
-            阈值由芯片内部 trim 数据推导，用于 SET/RESET 线圈驱动的
-            阈值判断。阈值超上限时钳位到 0xFF。
-        """
-        trim = self._read_reg(MMC5603_REG_ST_X_VAL, _ST_TRIM_LEN)
-        for i in range(_ST_TRIM_LEN):
-            delta = (trim[i] - _ST_TRIM_BIAS) * _ST_TRIM_SCALE
-            if delta < 0:
-                delta = -delta
-            st_thd = (delta - delta // _ST_DIV_5) // _ST_DIV_8
-            if st_thd > _ST_MAX:
-                st_thd = _ST_MAX
-            self._write_reg(_ST_THD_REGS[i], st_thd)
-
-    def _set_coil(self):
-        """执行 SET 线圈操作（磁滞复位），并等待线圈稳定。"""
-        self._write_reg(MMC5603_REG_CTRL0, CTRL0_SET)
-        time.sleep_ms(_SET_DELAY_MS)
-
-    def _configure_continuous(self, bandwidth=0x00, sample_rate_hz=50):
-        """
-        配置连续测量模式。
-
-        Args:
-            bandwidth (int): CTRL1 带宽设置（0x00 为默认）。
-            sample_rate_hz (int): ODR 寄存器值（0..255，值越大速率越高）。
-        """
-        self._write_reg(MMC5603_REG_CTRL1, bandwidth)
-        self._write_reg(MMC5603_REG_ODR, sample_rate_hz)
-        self._write_reg(MMC5603_REG_CTRL0, CTRL0_CMM_FREQ | CTRL0_AUTO_SR)
-        self._write_reg(MMC5603_REG_CTRL2, CTRL2_AUTO_ST)
-
-    # ==================== 读取 API ====================
     def read_raw(self):
         """
-        读取原始 20 位三轴数据并缓存。
+        读三轴 20 位原始计数，不做换算、不扣偏移。
 
         Returns:
-            tuple: (raw_x, raw_y, raw_z) 原始整数。
+            tuple: (raw_x, raw_y, raw_z)，每个 0..2**20-1。
 
         Raises:
             OSError: I2C 读取失败。
+            RuntimeError: 设备已 deinit。
         """
-        self._read_reg_into(MMC5603_REG_DATA, self._buf)
-        b = self._buf
-        self._raw_x = (b[0] << 12) | (b[1] << 4) | (b[6] >> 4)
-        self._raw_y = (b[2] << 12) | (b[3] << 4) | (b[7] >> 4)
-        self._raw_z = (b[4] << 12) | (b[5] << 4) | (b[8] >> 4)
-        return self._raw_x, self._raw_y, self._raw_z
+        self._read_into(_REG_DATA, self._data_buf)
+        raw_x, raw_y, raw_z = self._parse_raw(self._data_buf)
+        self._raw_x = raw_x
+        self._raw_y = raw_y
+        self._raw_z = raw_z
+        return (raw_x, raw_y, raw_z)
 
     def read(self):
         """
-        读取并换算为物理量（减偏移、乘灵敏度系数）。
+        读三轴磁场强度，单位 mG（已扣硬磁偏移）。
+
+        每次调用都会重新从设备读取，不做缓存。
 
         Returns:
-            tuple: (gx, gy, gz)，单位参见模块 docstring。
+            tuple: (x_mg, y_mg, z_mg)，float，单位 mG。
 
         Raises:
             OSError: I2C 读取失败。
+            RuntimeError: 设备已 deinit。
         """
-        rx, ry, rz = self.read_raw()
-        return (
-            -_SENSITIVITY * (rx - self._offset_x),
-            -_SENSITIVITY * (ry - self._offset_y),
-            -_SENSITIVITY * (rz - self._offset_z),
-        )
+        raw_x, raw_y, raw_z = self.read_raw()
+        x_mg = _LSB_MG * (raw_x - self._offset_x)
+        y_mg = _LSB_MG * (raw_y - self._offset_y)
+        z_mg = _LSB_MG * (raw_z - self._offset_z)
+        return (x_mg, y_mg, z_mg)
 
-    def get_data(self):
-        """[兼容别名] 请使用 read()。将在 v2.0 移除。"""
-        return self.read()
-
-    # ==================== 校准 API ====================
-    def set_calibration(self, offset_x, offset_y, offset_z):
+    def read_strength(self):
         """
-        设置硬铁偏移。
+        读磁场模长，单位 mG，等于 sqrt(x² + y² + z²)。
+
+        Returns:
+            float: 磁场模长，单位 mG，非负。
+
+        Raises:
+            OSError: I2C 读取失败。
+            RuntimeError: 设备已 deinit。
+        """
+        x_mg, y_mg, z_mg = self.read()
+        return math.sqrt(x_mg * x_mg + y_mg * y_mg + z_mg * z_mg)
+
+    def get_heading(self, declination=0.0):
+        """
+        计算水平面内航向角，顺时针为正。
+
+        坐标：板子 +Y 指向磁北 -> 0°，+X -> 90°，-Y -> 180°，-X -> 270°。
+        仅在传感器水平放置时有效；倾斜时需先做 tilt compensation。
 
         Args:
-            offset_x, offset_y, offset_z (int | float): 20 位原始值域偏移。
+            declination (float): 磁偏角，单位 度，默认 0.0（输出相对磁北）。
+                非 0 时输出相对真北；东偏为正，西偏为负；建议 [-180, 180]。
+
+        Returns:
+            float: 航向角，单位 度，范围 [0, 360)。
+
+        Raises:
+            OSError: I2C 读取失败。
+            RuntimeError: 设备已 deinit。
         """
+        x_mg, y_mg, _z_mg = self.read()
+        heading = math.degrees(math.atan2(-x_mg, y_mg)) + declination
+        if heading < 0.0:
+            heading += _HEADING_FULL_TURN_DEG
+        elif heading >= _HEADING_FULL_TURN_DEG:
+            heading -= _HEADING_FULL_TURN_DEG
+        return heading
+
+    def calibrate(self, duration_ms=20000, sample_delay_ms=20, progress_fn=None):
+        """
+        采集硬磁偏移（各轴 raw 的 min/max 中值）。
+
+        调用方式：在 duration_ms 内缓慢旋转板子"8"字。
+
+        Args:
+            duration_ms (int): 采集时长 ms，默认 20000，必须 > 0。
+            sample_delay_ms (int): 采样间隔 ms，默认 20，必须 > 0。
+            progress_fn: 可选回调 progress_fn(percent 0..100)。
+
+        Returns:
+            tuple: (offset_x, offset_y, offset_z)，float，单位 LSB。
+
+        Raises:
+            ValueError: 时长或间隔不为正。
+            OSError: 采集期间 I2C 读取失败。
+            RuntimeError: 设备已 deinit。
+
+        Side effects:
+            阻塞 duration_ms；更新偏移。不写文件。
+        """
+        if duration_ms <= 0:
+            raise ValueError("duration_ms must be > 0")
+        if sample_delay_ms <= 0:
+            raise ValueError("sample_delay_ms must be > 0")
+
+        raw_x, raw_y, raw_z = self.read_raw()
+        min_x = max_x = raw_x
+        min_y = max_y = raw_y
+        min_z = max_z = raw_z
+
+        start_ms = time.ticks_ms()
+        while True:
+            elapsed_ms = time.ticks_diff(time.ticks_ms(), start_ms)
+            if elapsed_ms >= duration_ms:
+                break
+
+            raw_x, raw_y, raw_z = self.read_raw()
+            if raw_x < min_x:
+                min_x = raw_x
+            if raw_x > max_x:
+                max_x = raw_x
+            if raw_y < min_y:
+                min_y = raw_y
+            if raw_y > max_y:
+                max_y = raw_y
+            if raw_z < min_z:
+                min_z = raw_z
+            if raw_z > max_z:
+                max_z = raw_z
+
+            if progress_fn is not None:
+                progress_fn(elapsed_ms * 100 // duration_ms)
+            time.sleep_ms(sample_delay_ms)
+
+        if progress_fn is not None:
+            progress_fn(100)
+
+        self._offset_x = (min_x + max_x) * 0.5
+        self._offset_y = (min_y + max_y) * 0.5
+        self._offset_z = (min_z + max_z) * 0.5
+        return (self._offset_x, self._offset_y, self._offset_z)
+
+    def save_calibration(self, path):
+        """
+        把当前偏移写入文本文件（一行三个逗号分隔浮点数，单位 LSB）。
+
+        不涉及 I2C，deinit 后仍可调用。
+
+        Args:
+            path (str): 目标文件路径。
+
+        Raises:
+            OSError: 文件无法创建或写入。
+        """
+        with open(path, "w") as handle:
+            handle.write(
+                "%s,%s,%s\n" % (self._offset_x, self._offset_y, self._offset_z)
+            )
+
+    def load_calibration(self, path):
+        """
+        从 save_calibration() 写出的文件读回偏移。
+
+        不涉及 I2C，deinit 后仍可调用。
+
+        Args:
+            path (str): 源文件路径。
+
+        Returns:
+            tuple: (offset_x, offset_y, offset_z)，float。
+
+        Raises:
+            OSError: 文件不存在或无法读取。
+            ValueError: 文件内容不是三个逗号分隔的数字。
+        """
+        with open(path) as handle:
+            parts = handle.read().strip().split(",")
+        if len(parts) != 3:
+            raise ValueError("calibration file must contain 3 comma-separated numbers")
+        offsets = (float(parts[0]), float(parts[1]), float(parts[2]))
+        self.calibration = offsets
+        return offsets
+
+    def deinit(self):
+        """
+        关闭连续测量并释放 I2C 引用。幂等（重复调用直接返回）。
+
+        deinit 之后任何 I/O 方法（read / read_raw / read_strength /
+        get_heading / calibrate）会抛 RuntimeError("device is deinitialized")。
+        纯计算与文件方法（calibration 属性、save_calibration、
+        load_calibration）仍可调用。
+        """
+        if self._i2c is None:
+            return
+        try:
+            self._wreg(_REG_CTRL0, 0x00)
+            self._wreg(_REG_CTRL2, 0x00)
+        finally:
+            self._i2c = None
+
+    # ------------------------------------------------------------------
+    # 属性
+    # ------------------------------------------------------------------
+
+    @property
+    def calibration(self):
+        """
+        当前硬磁偏移 (offset_x, offset_y, offset_z)，单位 LSB。
+
+        未校准时为 2**19 = 524288。不涉及 I2C。
+        """
+        return (self._offset_x, self._offset_y, self._offset_z)
+
+    @calibration.setter
+    def calibration(self, offsets):
+        """
+        设置硬磁偏移。
+
+        Args:
+            offsets: 长度 3 的序列，单位 LSB。
+
+        Raises:
+            ValueError: 长度不为 3 或元素非数字。
+        """
+        if len(offsets) != 3:
+            raise ValueError("calibration must be a 3-element sequence")
+        try:
+            offset_x = float(offsets[0])
+            offset_y = float(offsets[1])
+            offset_z = float(offsets[2])
+        except (TypeError, ValueError):
+            raise ValueError("calibration elements must be numbers")
         self._offset_x = offset_x
         self._offset_y = offset_y
         self._offset_z = offset_z
 
-    def get_calibration(self):
+    @property
+    def raw(self):
         """
-        返回当前硬铁偏移。
+        最近一次读取的原始 20 位计数 (raw_x, raw_y, raw_z)。
 
-        Returns:
-            tuple: (offset_x, offset_y, offset_z)
+        未读取过时为 (0, 0, 0)。不涉及 I2C。
         """
-        return self._offset_x, self._offset_y, self._offset_z
+        return (self._raw_x, self._raw_y, self._raw_z)
 
-    def calibrate(
-        self, duration_ms=20000, sample_interval_ms=20, progress_callback=None
-    ):
+    # ------------------------------------------------------------------
+    # 内部：解析（无副作用，便于单测）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_raw(buf):
         """
-        采集球面样本并计算硬铁偏移（8 字校准）。
+        解析 MMC5603 的 9 字节 20 位数据布局。无副作用。
+
+        字节布局（参考数据手册寄存器 0x00..0x08）：
+            X[19:12] = buf[0]
+            X[11:4]  = buf[1]
+            X[3:0]   = buf[6] >> 4
+            Y[19:12] = buf[2]
+            Y[11:4]  = buf[3]
+            Y[3:0]   = buf[7] >> 4
+            Z[19:12] = buf[4]
+            Z[11:4]  = buf[5]
+            Z[3:0]   = buf[8] >> 4
 
         Args:
-            duration_ms (int): 校准持续时间 ms，默认 20000。
-            sample_interval_ms (int): 采样间隔 ms，默认 20。
-            progress_callback (callable | None): 进度回调 fn(progress)，
-                progress 为 0..100 的整数；异常走 error_handler。
+            buf (bytearray | bytes): 长度 >= 9 的缓冲区。
 
         Returns:
-            tuple: (offset_x, offset_y, offset_z)，同时写入实例。
+            tuple: (raw_x, raw_y, raw_z)，每个 0..2**20-1。
+        """
+        raw_x = (buf[0] << 12) | (buf[1] << 4) | (buf[6] >> 4)
+        raw_y = (buf[2] << 12) | (buf[3] << 4) | (buf[7] >> 4)
+        raw_z = (buf[4] << 12) | (buf[5] << 4) | (buf[8] >> 4)
+        return (raw_x, raw_y, raw_z)
 
-        Notes:
-            - 校准期间需在空气中缓慢转动板子形成 8 字。
-            - 本方法不写文件、不 print；持久化由调用方负责。
-            - 采样间隔应 ≥ 20ms，避免超过 I2C 总线吞吐。
+    # ------------------------------------------------------------------
+    # 内部：I2C 原语（带重试 + deinit 检查）
+    # ------------------------------------------------------------------
+
+    def _check_deinit(self):
+        """
+        若设备已 deinit 则抛 RuntimeError。
+
+        Raises:
+            RuntimeError: 设备已 deinit。
+        """
+        if self._i2c is None:
+            raise RuntimeError("device is deinitialized")
+
+    def _wreg(self, reg, value):
+        """
+        写单字节寄存器，失败按 retries 重试。
+
+        Raises:
+            OSError: 连续 retries+1 次失败。
+            RuntimeError: 设备已 deinit。
         """
         self._check_deinit()
+        self._tx_buf[0] = value
+        last_error = None
+        for attempt in range(self._retries + 1):
+            try:
+                self._i2c.writeto_mem(self._addr, reg, self._tx_buf)
+                return
+            except OSError as exc:
+                last_error = exc
+                if attempt < self._retries:
+                    time.sleep_ms(self._retry_delay_ms)
+        raise last_error
 
-        self.read_raw()
-        min_x = max_x = self._raw_x
-        min_y = max_y = self._raw_y
-        min_z = max_z = self._raw_z
-
-        start = time.ticks_ms()
-        last_report = -1
-        while time.ticks_diff(time.ticks_ms(), start) < duration_ms:
-            self.read_raw()
-            if self._raw_x < min_x:
-                min_x = self._raw_x
-            if self._raw_x > max_x:
-                max_x = self._raw_x
-            if self._raw_y < min_y:
-                min_y = self._raw_y
-            if self._raw_y > max_y:
-                max_y = self._raw_y
-            if self._raw_z < min_z:
-                min_z = self._raw_z
-            if self._raw_z > max_z:
-                max_z = self._raw_z
-            time.sleep_ms(sample_interval_ms)
-
-            if progress_callback is not None:
-                elapsed = time.ticks_diff(time.ticks_ms(), start)
-                progress = elapsed * 100 // duration_ms
-                if progress != last_report:
-                    last_report = progress
-                    try:
-                        progress_callback(progress)
-                    except Exception as exc:
-                        self._call_error_handler(exc)
-
-        self._offset_x = (max_x + min_x) / 2
-        self._offset_y = (max_y + min_y) / 2
-        self._offset_z = (max_z + min_z) / 2
-        return self._offset_x, self._offset_y, self._offset_z
-
-    # ==================== 物理量计算 ====================
-    def get_strength(self):
+    def _read_into(self, reg, buf):
         """
-        返回磁场强度（单位与 read() 一致）。
+        读 len(buf) 字节到 buf（复用缓冲区，无临时分配）。
 
-        Returns:
-            float: sqrt(gx^2 + gy^2 + gz^2)。
+        Raises:
+            OSError: 连续 retries+1 次失败。
+            RuntimeError: 设备已 deinit。
         """
-        x, y, z = self.read()
-        return math.sqrt(x * x + y * y + z * z)
+        self._check_deinit()
+        last_error = None
+        for attempt in range(self._retries + 1):
+            try:
+                self._i2c.readfrom_mem_into(self._addr, reg, buf)
+                return buf
+            except OSError as exc:
+                last_error = exc
+                if attempt < self._retries:
+                    time.sleep_ms(self._retry_delay_ms)
+        raise last_error
 
-    def get_yaw(self, upright=False, declination=0.0):
+    def _read_reg(self, reg):
+        """读单个寄存器，返回 int。"""
+        return self._read_into(reg, self._rx_buf)[0]
+
+    # ------------------------------------------------------------------
+    # 内部：设备配置
+    # ------------------------------------------------------------------
+
+    def _chip_id(self):
+        """读器件 ID 寄存器（0x39）。"""
+        return self._read_reg(_REG_DEVICE_ID)
+
+    def _auto_selftest(self):
         """
-        计算偏航角。
+        按出厂 trim 值配置 ST 阈值寄存器 0x1E/0x1F/0x20。
+
+        算法与 MEMSIC 官方示例一致：
+            delta = |trim - 128| * 32
+            threshold = (delta - delta // 5) // 8，上限 255
+        """
+        self._read_into(_REG_ST_X_VAL, self._st_buf)
+        for axis in range(_ST_TRIM_BYTES):
+            delta = (self._st_buf[axis] - _ST_TRIM_CENTER) * _ST_TRIM_SCALE
+            if delta < 0:
+                delta = -delta
+            threshold = (delta - delta // 5) // 8
+            if threshold > _ST_THD_MAX:
+                threshold = _ST_THD_MAX
+            self._wreg(_REG_X_THD + axis, threshold)
+
+    def _set(self):
+        """执行一次手动 SET，复位磁芯磁化方向（阻塞 _SET_DELAY_MS）。"""
+        self._wreg(_REG_CTRL0, _CTRL0_SET)
+        time.sleep_ms(_SET_DELAY_MS)
+
+    def _start_continuous(self, bandwidth=_BANDWIDTH_DEFAULT, odr_hz=_ODR_HZ_DEFAULT):
+        """
+        进入连续测量模式。
 
         Args:
-            upright (bool): True 使用 XZ 平面（竖直安装）；
-                            False 使用 XY 平面（水平安装）。
-            declination (float): 磁偏角（度，东正西负）。
-
-        Returns:
-            float: yaw 角，范围 -180..180（度）。
+            bandwidth (int): CTRL1 带宽档位，默认 0x00。
+            odr_hz (int): ODR 寄存器值，默认 50。
         """
-        x, y, z = self.read()
-        if upright:
-            angle = math.degrees(math.atan2(z, -x)) + 180.0
-        else:
-            angle = math.degrees(math.atan2(y, -x)) + 180.0
-        return (angle + declination + 180.0) % 360.0 - 180.0
-
-    def get_heading(self, upright=False, declination=0.0):
-        """
-        计算航向角。
-
-        Args:
-            upright (bool): 同 get_yaw。
-            declination (float): 磁偏角（度）。
-
-        Returns:
-            float: 航向角，范围 0..360（度）。
-        """
-        return self.get_yaw(upright, declination) % 360.0
-
-    # ==================== 资源释放 ====================
-    def deinit(self):
-        """
-        释放资源：清空 I2C 引用，置 deinit 标志。幂等。
-
-        Notes:
-            deinit 后调用任何 I2C 方法抛 RuntimeError。
-        """
-        if self._deinit:
-            return
-        self._i2c = None
-        self._deinit = True
+        self._wreg(_REG_CTRL1, bandwidth)
+        self._wreg(_REG_ODR, odr_hz)
+        self._wreg(_REG_CTRL0, _CTRL0_CONTINUOUS)
+        self._wreg(_REG_CTRL2, _CTRL2_CMM_FREQ_EN)

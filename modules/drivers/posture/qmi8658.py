@@ -63,7 +63,6 @@ QMI8658_REG_CAL3_H = const(0x10)
 QMI8658_REG_FIFO_WTM_TH = const(0x13)
 QMI8658_REG_FIFO_CTRL = const(0x14)
 QMI8658_REG_FIFO_SMPL_CNT = const(0x15)
-QMI8658_REG_FIFO_STATUS = const(0x16)
 QMI8658_REG_FIFO_DATA = const(0x17)
 QMI8658_REG_STATUS_INT = const(0x2D)
 QMI8658_REG_STEP_CNT_LOW = const(0x45)
@@ -125,8 +124,7 @@ STATUSINT_BIT_FIFO = const(1 << 5)
 STATUSINT_BIT_CMD_DONE = const(1 << 7)
 
 # 内部常量
-_FIFO_SAMPLE_BYTES = const(14)
-_DATA_BYTES = const(14)
+_SAMPLE_BYTES = const(14)
 
 
 class QMI8658:
@@ -154,9 +152,6 @@ class QMI8658:
         "_retry_delay_ms",
         "_deinit",
         "_pending",
-        "_acc_range",
-        "_gyr_range",
-        "_acc_gyr_odr",
         "_buf",
         "_fifo_buf",
         "acc_lsb_div",
@@ -198,9 +193,6 @@ class QMI8658:
 
         self._i2c = i2c_bus
         self._addr = addr
-        self._acc_range = acc_range
-        self._gyr_range = gyr_range
-        self._acc_gyr_odr = acc_gyr_odr
 
         self._int_pins = {
             INT_PIN_1: self._normalize_pin(int1_pin),
@@ -218,10 +210,9 @@ class QMI8658:
         self._error_handler = error_handler
         self._retries = retries
         self._retry_delay_ms = retry_delay_ms
-        self._deinit = False
         self._pending = False
-        self._buf = bytearray(_DATA_BYTES)
-        self._fifo_buf = bytearray(_FIFO_SAMPLE_BYTES)
+        self._buf = bytearray(_SAMPLE_BYTES)
+        self._fifo_buf = bytearray(_SAMPLE_BYTES)
 
         # 换算系数默认值，init() 会覆盖
         self.acc_lsb_div = 1 << (14 - acc_range)
@@ -259,7 +250,7 @@ class QMI8658:
 
     # ==================== 底层 I2C ====================
     def _check_deinit(self):
-        if self._deinit:
+        if self._i2c is None:
             raise RuntimeError("device is deinitialized")
 
     def _write_reg(self, reg, val):
@@ -366,9 +357,6 @@ class QMI8658:
         self.gyr_lsb_div = 2 ** (11 - gyr_range)
         self.acc_lsb_div = 1 << (14 - acc_range)
         self._drdy_int_pin = drdy_int_pin
-        self._acc_range = acc_range
-        self._gyr_range = gyr_range
-        self._acc_gyr_odr = acc_gyr_odr
 
     # ================================================================
     #  中断 API
@@ -558,11 +546,6 @@ class QMI8658:
         gyr = (gyr_raw[0] / gyr_div, gyr_raw[1] / gyr_div, gyr_raw[2] / gyr_div)
         return acc, gyr, round(temp_raw / 256.0, 2)
 
-    # 兼容别名
-    def get_data(self):
-        """[兼容别名] 请使用 read()。将在 v2.0 移除。"""
-        return self.read()
-
     def get_accelerometer(self):
         return self.read()[0]
 
@@ -572,15 +555,11 @@ class QMI8658:
     def get_temperature(self):
         return self.read()[2]
 
-    def get_strength(self):
-        x, y, z = self.get_accelerometer()
-        return math.sqrt(x * x + y * y + z * z)
-
     def get_pitch_roll(self):
         """返回 (pitch_deg, roll_deg)，俯仰角正值表示机头抬起。"""
         x, y, z = self.get_accelerometer()
-        pitch = math.atan2(-x, math.sqrt(y * y + z * z))
-        roll = math.atan2(y, z)
+        pitch = math.atan2(y, math.sqrt(x * x + z * z))
+        roll = math.atan2(-x, math.sqrt(y * y + z * z))
         return math.degrees(pitch), math.degrees(roll)
 
     # ================================================================
@@ -589,7 +568,7 @@ class QMI8658:
     def drdy_interrupt(
         self, enable=True, handler=None, trigger=Pin.IRQ_RISING, hard=False
     ):
-        """数据就绪中断，固定路由到 INT2（FIFO 需处于 Bypass 模式）。"""
+        """数据就绪中断，路由到 init() 中指定的 drdy_int_pin（FIFO 需处于 Bypass 模式）。"""
         ctrl7 = self._read_reg(QMI8658_REG_CTRL7)
         if enable:
             ctrl7 &= ~(1 << 5)
@@ -597,7 +576,9 @@ class QMI8658:
         else:
             ctrl7 |= 1 << 5
         self._write_reg(QMI8658_REG_CTRL7, ctrl7)
-        self.attach_interrupt(INT_PIN_2, handler, trigger, STATUSINT_BIT_DRDY, hard)
+        self.attach_interrupt(
+            self._drdy_int_pin, handler, trigger, STATUSINT_BIT_DRDY, hard
+        )
 
     def fifo_interrupt(
         self,
@@ -825,8 +806,7 @@ class QMI8658:
         Notes:
             deinit 后调用任何 I2C 方法抛 RuntimeError("device is deinitialized")。
         """
-        if self._deinit:
+        if self._i2c is None:
             return
         self.detach_interrupt()
         self._i2c = None
-        self._deinit = True

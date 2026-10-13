@@ -110,22 +110,18 @@ class PCF85063:
         "_retries",
         "_retry_delay_ms",
         "_deinit",
-        "_time_fn",
-        "_ticks_diff_fn",
         "_buf1",
     )
 
     def __init__(
         self,
         i2c,
-        address=None,
+        address=DEFAULT_ADDRESS,
         year_base=1970,
         int_pin=None,
         error_handler=None,
         retries=2,
         retry_delay_ms=5,
-        time_fn=time.ticks_ms,
-        ticks_diff_fn=time.ticks_diff,
     ):
         """
         Args:
@@ -136,8 +132,6 @@ class PCF85063:
             error_handler (callable | None): ISR 异常回调，签名 fn(exc)。
             retries (int): I2C 重试次数，默认 2（总共尝试 retries+1 次）。
             retry_delay_ms (int): 重试间隔 ms，默认 5。
-            time_fn (callable): 时间源，默认 time.ticks_ms。
-            ticks_diff_fn (callable): 时间差函数，默认 time.ticks_diff。
 
         Raises:
             ValueError: 参数非法。
@@ -145,7 +139,6 @@ class PCF85063:
         if i2c is None:
             raise ValueError("i2c must not be None")
 
-        addr = DEFAULT_ADDRESS if address is None else address
         if not isinstance(addr, int) or not (0x00 <= addr <= 0x7F):
             raise ValueError("address must be int in 0..0x7F")
 
@@ -163,9 +156,7 @@ class PCF85063:
         self._error_handler = error_handler
         self._retries = retries
         self._retry_delay_ms = retry_delay_ms
-        self._deinit = False
-        self._time_fn = time_fn
-        self._ticks_diff_fn = ticks_diff_fn
+
         self._buf1 = bytearray(1)
 
     # ---------------- 只读属性 ----------------
@@ -181,7 +172,7 @@ class PCF85063:
 
     # ---------------- 内部工具 ----------------
     def _check_deinit(self):
-        if self._deinit:
+        if self._i2c is None:
             raise RuntimeError("device is deinitialized")
 
     def _read_reg(self, reg, nbytes):
@@ -498,7 +489,7 @@ class PCF85063:
         Notes:
             deinit 后调用任何 I2C 方法抛 RuntimeError。
         """
-        if self._deinit:
+        if self._i2c is None:
             return
         try:
             self.detach_interrupt()
@@ -510,4 +501,3 @@ class PCF85063:
             pass
         self._i2c = None
         self._addr = None
-        self._deinit = True
